@@ -96,6 +96,31 @@ static const Ssd1677Config& ssd1677StickyConfig() {
   return cfg;
 }
 
+// Waveshare ESP32-S3-ePaper-3.97. Same SSD1677 init as Sticky; the vendor's
+// EPD_3in97.cpp uses 0x22 = 0xF7 (full), 0xD7 (its "fast" ~1.5 s mode, which needs
+// 0x1A = 0x6A) and 0xFF (partial, border 0x80, border 0x01 otherwise). We take the
+// partial 0xFF as the fast UI path, as on Sticky. Booster, scan byte and borders
+// match the vendor init exactly. The grayscale LUT is the Sticky copy — unvalidated
+// on this panel (the vendor ships its own 4-gray LUT in Init_4GRAY).
+static const Ssd1677Config& ssd1677Waveshare397Config() {
+  static const Ssd1677Config cfg = {
+      {0xAE, 0xC7, 0xC3, 0xC0, 0x80},  // booster soft-start (vendor 0x0C)
+      DRIVER_OUTPUT_SCAN,              // vendor 0x01 third byte 0x02
+      0x01,                            // borderWaveformInit: vendor 0x3C = 0x01
+      0x5A,                            // halfRefreshTemp (unused: fullSeqOverride loads temperature)
+      lut_grayscale_sticky,
+      0xF7,  // fullSeqOverride: vendor full
+      0xFF,  // fastSeqOverride: vendor partial
+      0x00,  // halfSeqOverride: use fullSeqOverride
+      0x01,  // borderWaveformFull
+      0x80,  // borderWaveformFast: vendor partial border
+      0x00,  // borderWaveformHalf: use full
+      0x80,  // borderWaveformGray: hold at VCOM (as Sticky)
+      true,  // grayPowerUpFirst: sequences power down after every refresh
+  };
+  return cfg;
+}
+
 // ── Reusable per-board waveform shortcuts ────────────────────────────────────
 // Opt-in optimizations a board can layer onto a base Ssd1677Config when its
 // specific panel is known to tolerate them. Each is a pure copy-and-tweak so a
@@ -617,6 +642,7 @@ static const Ssd1677Config& ssd1677ActiveConfig() { return FREEINK_SSD1677_CONFI
 static const Ssd1677Config& ssd1677ActiveConfig() {
   switch (BoardConfig::ACTIVE.board) {
     case BoardConfig::Board::Sticky: return ssd1677StickyConfig();
+    case BoardConfig::Board::Waveshare397: return ssd1677Waveshare397Config();
     // X4 layers the fast-DU shortcut on the default only when the build has
     // opted in (see ssd1677X4Config); stock 0xFC parity otherwise.
 #ifdef FREEINK_X4_FAST_DU_SHORTCUT

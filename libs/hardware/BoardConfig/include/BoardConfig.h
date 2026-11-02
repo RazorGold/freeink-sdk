@@ -17,6 +17,10 @@
 
 #include <Arduino.h>
 #include <driver/gpio.h>  // gpio_hold_dis in releaseSdRail()
+#if FREEINK_DEVICE_WAVESHARE397
+#include <Wire.h>
+#include <esp_rom_sys.h>
+#endif
 
 // ============================================================================
 // Build composition — devices x capabilities
@@ -53,12 +57,15 @@
 #ifndef FREEINK_DEVICE_STICKY
 #define FREEINK_DEVICE_STICKY 0
 #endif
+#ifndef FREEINK_DEVICE_WAVESHARE397
+#define FREEINK_DEVICE_WAVESHARE397 0
+#endif
 
 // --- 2) Coherence: exactly one MCU family, at least one device ---------------
 #if !(FREEINK_DEVICE_X4 || FREEINK_DEVICE_X3 || FREEINK_DEVICE_M5 || FREEINK_DEVICE_MURPHY || FREEINK_DEVICE_DELINK || \
-      FREEINK_DEVICE_LILYGO || FREEINK_DEVICE_M5PAPER || FREEINK_DEVICE_STICKY)
+      FREEINK_DEVICE_LILYGO || FREEINK_DEVICE_M5PAPER || FREEINK_DEVICE_STICKY || FREEINK_DEVICE_WAVESHARE397)
 #error \
-    "FreeInk: no device selected. Pass at least one -DFREEINK_DEVICE_<NAME> (X4, X3, M5, MURPHY, DELINK, LILYGO, M5PAPER, STICKY) in your build env — see platformio.sample.ini."
+    "FreeInk: no device selected. Pass at least one -DFREEINK_DEVICE_<NAME> (X4, X3, M5, MURPHY, DELINK, LILYGO, M5PAPER, STICKY, WAVESHARE397) in your build env — see platformio.sample.ini."
 #endif
 // Each device belongs to one MCU family; a binary targets exactly one. X3/X4 are
 // ESP32-C3; M5 PaperColor/Murphy/de-link/LilyGo are ESP32-S3; M5Paper v1.1 is the
@@ -66,18 +73,19 @@
 // SPI peripheral count, and toolchain, so they never share a binary.
 #define FREEINK_MCU_C3 (FREEINK_DEVICE_X3 || FREEINK_DEVICE_X4)
 #define FREEINK_MCU_S3 \
-  (FREEINK_DEVICE_M5 || FREEINK_DEVICE_MURPHY || FREEINK_DEVICE_DELINK || FREEINK_DEVICE_LILYGO || FREEINK_DEVICE_STICKY)
+  (FREEINK_DEVICE_M5 || FREEINK_DEVICE_MURPHY || FREEINK_DEVICE_DELINK || FREEINK_DEVICE_LILYGO || \
+   FREEINK_DEVICE_STICKY || FREEINK_DEVICE_WAVESHARE397)
 #define FREEINK_MCU_ESP32 (FREEINK_DEVICE_M5PAPER)
 #if (FREEINK_MCU_C3 + FREEINK_MCU_S3 + FREEINK_MCU_ESP32) != 1
 #error \
-    "FreeInk: all selected devices must share one MCU family — ESP32-C3 (X3/X4), ESP32-S3 (M5/Murphy/de-link/LilyGo/Sticky), or ESP32 (M5Paper). Build one binary per family."
+    "FreeInk: all selected devices must share one MCU family — ESP32-C3 (X3/X4), ESP32-S3 (M5/Murphy/de-link/LilyGo/Sticky/Waveshare397), or ESP32 (M5Paper). Build one binary per family."
 #endif
 
 // --- 3) Derive panel drivers from the device set -----------------------------
 // Sticky reuses SSD1677: its 800x480 panel rides a 24-pin FPC whose GDR/RESE/BS1
 // + dual VSH1/VSH2 + external VGH/VGL/VSL/VCOM charge pump is the SSD1677
 // application circuit (same controller + resolution as X4 / de-link).
-#if FREEINK_DEVICE_X4 || FREEINK_DEVICE_DELINK || FREEINK_DEVICE_STICKY
+#if FREEINK_DEVICE_X4 || FREEINK_DEVICE_DELINK || FREEINK_DEVICE_STICKY || FREEINK_DEVICE_WAVESHARE397
 #define FREEINK_DRIVER_SSD1677 1
 #else
 #define FREEINK_DRIVER_SSD1677 0
@@ -220,7 +228,7 @@
 // gets a native esp-idf SDMMC block device behind SDCardManager. Every other
 // board stays on SdFat-over-SPI. Override with -DFREEINK_SD_SDMMC=0/1.
 #ifndef FREEINK_SD_SDMMC
-#define FREEINK_SD_SDMMC (FREEINK_DEVICE_DELINK)
+#define FREEINK_SD_SDMMC (FREEINK_DEVICE_DELINK || FREEINK_DEVICE_WAVESHARE397)
 #endif
 
 // Serial log transport hint for consumer firmware. Boards can share the same MCU
@@ -253,6 +261,7 @@ enum class Board : uint8_t {
   LilyGoT5S3,
   M5PaperV11,
   Sticky,
+  Waveshare397,
 };
 
 // How the board reports button presses.
@@ -908,6 +917,46 @@ constexpr BoardProfile STICKY = {
     // boot (the vendor demo's first init step) — see holdPowerRails().
     {45, 46}};
 
+// --- Waveshare ESP32-S3-ePaper-3.97 — ESP32-S3-WROOM-1-N16R8 -----------------
+// 3.97" 800x480 SSD1677 B/W panel over SPI, 4-bit SDMMC card, AXP2101 PMIC, three
+// keys (Up/Select/Down) + BOOT, no touch. Pin map from Waveshare's example repo
+// (EPD/SD/I2C) and community docs (keys); see the port brief for the evidence
+// labels. Bring-up status: display only so far — everything below the display is
+// wired from the brief but unvalidated on hardware.
+//   * Display SPI clock is pinned to 10 MHz (datasheet max 20; driver default 40
+//     is out of spec). Raise once a unit is stable.
+//   * Panel rail: which AXP2101 output feeds the panel/SD is unknown, so
+//     holdPowerRails() enables DC1 + ALDO1-3 at 3.3 V (the vendor's set-up).
+//   * Keys: the rocker is Up 4 / Down 6 with its press-in as Select 5 (active-low);
+//     BOOT (GPIO0) is Back. No left/right. PWR is the AXP2101 PEK, not a GPIO
+//     (power = unassigned); see lib/hal/Axp2101Pek.
+//   * Battery (AXP2101 gauge), RTC (PCF85063), IMU (QMI8658) are not wired yet.
+constexpr BoardProfile WAVESHARE_397 = {
+    Board::Waveshare397,
+    "waveshare_397",
+    InputStyle::DigitalButtons,
+    DisplayController::SSD1677,
+    800,
+    480,
+    {11, 12, 10, 9, 46, 3, PIN_UNASSIGNED},  // SCK11 MOSI12 CS10 DC9 RST46 BUSY3; no EPD power-enable GPIO
+    10000000,                                 // displaySpiHz: 10 MHz (datasheet max 20 MHz)
+    {PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, false, 0},  // SD is SDMMC
+    // back=BOOT0, confirm=Select (rocker press) 5, up4 down6; left/right none. Active-low.
+    // power is unassigned: the real PWR key is the AXP2101 PEK, not a GPIO. The app
+    // surfaces it as BTN_POWER through InputManager::setButtonHook (Axp2101Pek).
+    {0, 5, PIN_UNASSIGNED, PIN_UNASSIGNED, 4, 6, PIN_UNASSIGNED, false},
+    PIN_UNASSIGNED,  // batteryAdc: none — AXP2101 (not yet wired)
+    PIN_UNASSIGNED,
+    2.0f,
+    PIN_UNASSIGNED,
+    NO_TOUCH,
+    NO_FRONTLIGHT,
+    NO_AUDIO,
+    NO_LEDS,
+    NO_FLIP,  // mount orientation pending validation on a unit
+    {16, 17, 15, 7, 8, 18, 4},  // SDMMC 4-bit: CLK16 CMD17 D0=15 D1=7 D2=8 D3=18
+    NO_GAUGE};
+
 // Largest framebuffer (bytes) over the devices compiled into this build, derived
 // from the profiles above. The display facade sizes its static framebuffer to
 // this so one binary holds whichever panel is runtime-selected; a single-device
@@ -924,7 +973,8 @@ constexpr uint32_t MAX_FRAMEBUFFER_BYTES = cmax(
     cmax(cmax(cmax(FREEINK_DEVICE_DELINK ? panelBytes(DE_LINK) : 0u,
                    FREEINK_DEVICE_LILYGO ? panelBytes(LILYGO_T5S3) : 0u),
               FREEINK_DEVICE_M5PAPER ? panelBytes(M5PAPER_V11) : 0u),
-         FREEINK_DEVICE_STICKY ? panelBytes(STICKY) : 0u));
+         cmax(FREEINK_DEVICE_STICKY ? panelBytes(STICKY) : 0u,
+              FREEINK_DEVICE_WAVESHARE397 ? panelBytes(WAVESHARE_397) : 0u)));
 
 // Compile-time default device — the profile ACTIVE starts as. With a single
 // device in the build this is the only device; with several same-MCU devices it
@@ -941,6 +991,8 @@ constexpr BoardProfile DEFAULT_DEVICE = LILYGO_T5S3;
 constexpr BoardProfile DEFAULT_DEVICE = M5PAPER_V11;
 #elif FREEINK_DEVICE_STICKY
 constexpr BoardProfile DEFAULT_DEVICE = STICKY;
+#elif FREEINK_DEVICE_WAVESHARE397
+constexpr BoardProfile DEFAULT_DEVICE = WAVESHARE_397;
 #elif FREEINK_DEVICE_X3 && !FREEINK_DEVICE_X4
 constexpr BoardProfile DEFAULT_DEVICE = XTEINK_X3;  // X3-only binary
 #else
@@ -998,6 +1050,11 @@ inline bool selectDevice(Board which) {
       ACTIVE = STICKY;
       return true;
 #endif
+#if FREEINK_DEVICE_WAVESHARE397
+    case Board::Waveshare397:
+      ACTIVE = WAVESHARE_397;
+      return true;
+#endif
     default:
       break;
   }
@@ -1009,9 +1066,54 @@ inline bool isMurphyM3() { return ACTIVE.board == Board::MurphyM3; }
 inline bool isDeLink() { return ACTIVE.board == Board::DeLink; }
 inline bool isM5PaperV11() { return ACTIVE.board == Board::M5PaperV11; }
 inline bool isSticky() { return ACTIVE.board == Board::Sticky; }
+inline bool isWaveshare397() { return ACTIVE.board == Board::Waveshare397; }
 inline bool hasTouch() { return ACTIVE.touch.controller != TouchController::None; }
 inline bool hasPwmFrontlight() { return ACTIVE.frontlight.gpio != PIN_UNASSIGNED; }
 inline bool hasAudio() { return ACTIVE.audio.output != AudioOutput::None; }
+
+#if FREEINK_DEVICE_WAVESHARE397
+// Waveshare 3.97": the panel and SD card sit behind AXP2101 rails (which one is
+// not documented), so bring DC1 + ALDO1-3 up to 3.3 V — the vendor's axp_init()
+// values (components/axpPower/axp_prot.cpp) — before the first display/SD use.
+// Registers per XPowersLib AXP2101Constants.h: 0x80 DC enable (b0 DC1), 0x82 DC1
+// volt (1.5 V + 100 mV/step), 0x90 LDO enable (b0..b2 ALDO1..3), 0x92..0x94 ALDOn
+// volt (0.5 V + 100 mV/step). The vendor sets voltages but never explicitly
+// enables the ALDOs, so the enable bits here are an addition — hence the log.
+// I2C: SDA41 / SCL42, address 0x34. Best-effort: failures are logged, not fatal.
+inline void initAxp2101Rails() {
+  constexpr uint8_t ADDR = 0x34;
+  Wire.begin(41, 42, 400000);
+  auto rd = [](uint8_t reg, uint8_t& out) {
+    Wire.beginTransmission(ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom(ADDR, static_cast<uint8_t>(1)) != 1) return false;
+    out = Wire.read();
+    return true;
+  };
+  auto wr = [](uint8_t reg, uint8_t v) {
+    Wire.beginTransmission(ADDR);
+    Wire.write(reg);
+    Wire.write(v);
+    return Wire.endTransmission() == 0;
+  };
+  uint8_t dc = 0, ldo = 0;
+  if (!rd(0x80, dc) || !rd(0x90, ldo)) {
+    esp_rom_printf("[AXP] 0x34 not responding; rails left as-is\n");
+    return;
+  }
+  esp_rom_printf("[AXP] before: DC_EN=0x%02X LDO_EN=0x%02X\n", dc, ldo);
+  uint8_t v;
+  wr(0x82, (3300 - 1500) / 100);  // DC1 3.3 V
+  for (uint8_t reg = 0x92; reg <= 0x94; reg++) {
+    if (!rd(reg, v)) continue;
+    wr(reg, (v & 0xE0) | ((3300 - 500) / 100));  // ALDO1..3 3.3 V, keep reserved bits
+  }
+  wr(0x80, dc | 0x01);  // enable DC1
+  wr(0x90, ldo | 0x07);  // enable ALDO1..3
+  if (rd(0x80, dc) && rd(0x90, ldo)) esp_rom_printf("[AXP] after:  DC_EN=0x%02X LDO_EN=0x%02X\n", dc, ldo);
+}
+#endif
 
 // Assert the board's power-rail latch pins. Battery-latched boards (e.g. the
 // Sticky) must call this first thing in setup() or the board powers off when
@@ -1024,6 +1126,9 @@ inline void holdPowerRails() {
       digitalWrite(pin, HIGH);
     }
   }
+#if FREEINK_DEVICE_WAVESHARE397
+  initAxp2101Rails();
+#endif
 }
 
 // Rescue the SD power rail before first display use. A previous firmware's
