@@ -20,7 +20,7 @@
 // to the generic FsBlockDeviceInterface (set in the de-link build env).
 #include <SdFat.h>  // FsBlockDeviceInterface, Sector_t
 
-struct sdmmc_card_t;  // forward decl (esp-idf type)
+#include <sd_protocol_types.h>  // sdmmc_card_t (an anonymous-struct typedef in IDF 5.x, so it can't be forward-declared)
 
 namespace freeink {
 
