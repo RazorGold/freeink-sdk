@@ -172,7 +172,8 @@
 // ACTIVE.batteryGauge.gaugeAddr != 0) — required because X3 (gauge) and X4 (ADC)
 // share one C3 binary.
 #ifndef FREEINK_BATTERY_I2C_GAUGE
-#define FREEINK_BATTERY_I2C_GAUGE (FREEINK_DEVICE_X3 || FREEINK_DEVICE_LILYGO || FREEINK_DEVICE_STICKY)
+#define FREEINK_BATTERY_I2C_GAUGE \
+  (FREEINK_DEVICE_X3 || FREEINK_DEVICE_LILYGO || FREEINK_DEVICE_STICKY || FREEINK_DEVICE_WAVESHARE397)
 #endif
 #ifndef FREEINK_CAP_COLOR
 #define FREEINK_CAP_COLOR (FREEINK_DEVICE_M5)
@@ -189,7 +190,7 @@
 // On-board I2C sensors. Each lib (Rtc / EnvironmentSensor / Imu) compiles its
 // I2C driver only when its flag is set; otherwise it links stub bodies.
 #ifndef FREEINK_CAP_RTC
-#define FREEINK_CAP_RTC (FREEINK_DEVICE_X3 || FREEINK_DEVICE_STICKY)
+#define FREEINK_CAP_RTC (FREEINK_DEVICE_X3 || FREEINK_DEVICE_STICKY || FREEINK_DEVICE_WAVESHARE397)
 #endif
 #ifndef FREEINK_CAP_TEMP_HUMIDITY
 #define FREEINK_CAP_TEMP_HUMIDITY (FREEINK_DEVICE_STICKY)
@@ -330,6 +331,10 @@ struct SdmmcPins {
 // gaugeAddr != 0 (and FREEINK_BATTERY_I2C_GAUGE is set), BatteryMonitor reads the
 // gauge over I2C instead of an ADC pin. chargerAddr is optional (0 = none) and
 // only used for charge status.
+// Which chip answers at BatteryGaugeConfig::gaugeAddr. BQ27220 is the default so
+// existing profiles need no change; the Waveshare 3.97" reads its AXP2101 PMIC.
+enum class GaugeChip : uint8_t { Bq27220, Axp2101 };
+
 struct BatteryGaugeConfig {
   int8_t i2cSda;
   int8_t i2cScl;
@@ -342,6 +347,7 @@ struct BatteryGaugeConfig {
   // Wire1/SDA1-SCL0) so they don't fight over one controller. Only honored on
   // multi-bus SoCs (SOC_I2C_NUM > 1); single-bus parts (ESP32-C3) ignore it.
   uint8_t i2cBus = 0;
+  GaugeChip chip = GaugeChip::Bq27220;
 };
 
 struct InputPins {
@@ -430,7 +436,7 @@ struct MicConfig {
   bool enableActiveHigh;
 };
 
-enum class RtcType : uint8_t { None, Pcf8563, Ds3231 };
+enum class RtcType : uint8_t { None, Pcf8563, Ds3231, Pcf85063 };
 enum class ImuType : uint8_t { None, Lsm6ds3, Qmi8658 };
 
 // On-board I2C sensors sharing one bus (e.g. the Sticky's RTC + temp/humidity +
@@ -925,12 +931,13 @@ constexpr BoardProfile STICKY = {
 // wired from the brief but unvalidated on hardware.
 //   * Display SPI clock is pinned to 10 MHz (datasheet max 20; driver default 40
 //     is out of spec). Raise once a unit is stable.
-//   * Panel rail: which AXP2101 output feeds the panel/SD is unknown, so
-//     holdPowerRails() enables DC1 + ALDO1-3 at 3.3 V (the vendor's set-up).
+//   * Panel rail: the e-paper is on AXP2101 ALDO3. holdPowerRails() sets DC1 + ALDO3 to 3.3 V,
+//     leaves the unused audio rails (ALDO1/2) off, and applies the vendor charger config.
 //   * Keys: the rocker is Up 4 / Down 6 with its press-in as Select 5 (active-low);
 //     BOOT (GPIO0) is Back. No left/right. PWR is the AXP2101 PEK, not a GPIO
 //     (power = unassigned); see lib/hal/Axp2101Pek.
-//   * Battery (AXP2101 gauge), RTC (PCF85063), IMU (QMI8658) are not wired yet.
+//   * Battery level/charging come from the AXP2101 (BatteryMonitor), the clock is the
+//     PCF85063 (Rtc). IMU (QMI8658) is not wired; tilt-to-turn is not wanted here.
 constexpr BoardProfile WAVESHARE_397 = {
     Board::Waveshare397,
     "waveshare_397",
@@ -945,7 +952,7 @@ constexpr BoardProfile WAVESHARE_397 = {
     // power is unassigned: the real PWR key is the AXP2101 PEK, not a GPIO. The app
     // surfaces it as BTN_POWER through InputManager::setButtonHook (Axp2101Pek).
     {0, 5, PIN_UNASSIGNED, PIN_UNASSIGNED, 4, 6, PIN_UNASSIGNED, false},
-    PIN_UNASSIGNED,  // batteryAdc: none — AXP2101 (not yet wired)
+    PIN_UNASSIGNED,  // batteryAdc: none — the AXP2101 is the gauge, below
     PIN_UNASSIGNED,
     2.0f,
     PIN_UNASSIGNED,
@@ -955,7 +962,11 @@ constexpr BoardProfile WAVESHARE_397 = {
     NO_LEDS,
     NO_FLIP,  // mount orientation pending validation on a unit
     {16, 17, 15, 7, 8, 18, 4},  // SDMMC 4-bit: CLK16 CMD17 D0=15 D1=7 D2=8 D3=18
-    NO_GAUGE};
+    // AXP2101 PMIC at 0x34 on SDA41/SCL42 reports battery %, voltage, charge state, VBUS.
+    {41, 42, 400000, 0x34, 0, 0, GaugeChip::Axp2101},
+    NO_MIC,
+    // PCF85063 RTC (0x51) on the same bus. No temp/humidity, no IMU.
+    {41, 42, 400000, 0x51, 0, 0, 0, RtcType::Pcf85063, ImuType::None}};
 
 // Largest framebuffer (bytes) over the devices compiled into this build, derived
 // from the profiles above. The display facade sizes its static framebuffer to
@@ -1072,13 +1083,14 @@ inline bool hasPwmFrontlight() { return ACTIVE.frontlight.gpio != PIN_UNASSIGNED
 inline bool hasAudio() { return ACTIVE.audio.output != AudioOutput::None; }
 
 #if FREEINK_DEVICE_WAVESHARE397
-// Waveshare 3.97": the panel and SD card sit behind AXP2101 rails (which one is
-// not documented), so bring DC1 + ALDO1-3 up to 3.3 V — the vendor's axp_init()
-// values (components/axpPower/axp_prot.cpp) — before the first display/SD use.
+// Waveshare 3.97": the panel sits behind AXP2101 ALDO3 (vendor epaper_port.c). Bring DC1 and
+// ALDO3 up at 3.3 V — the vendor's axp_init() values (components/axpPower/axp_prot.cpp) — and
+// leave the audio rails (ALDO1/2) off, before the first display/SD use. Also applies the
+// vendor's charger configuration.
 // Registers per XPowersLib AXP2101Constants.h: 0x80 DC enable (b0 DC1), 0x82 DC1
 // volt (1.5 V + 100 mV/step), 0x90 LDO enable (b0..b2 ALDO1..3), 0x92..0x94 ALDOn
 // volt (0.5 V + 100 mV/step). The vendor sets voltages but never explicitly
-// enables the ALDOs, so the enable bits here are an addition — hence the log.
+// enables the ALDOs, so the ALDO3 enable bit here is an addition — hence the log.
 // I2C: SDA41 / SCL42, address 0x34. Best-effort: failures are logged, not fatal.
 inline void initAxp2101Rails() {
   constexpr uint8_t ADDR = 0x34;
@@ -1109,8 +1121,33 @@ inline void initAxp2101Rails() {
     if (!rd(reg, v)) continue;
     wr(reg, (v & 0xE0) | ((3300 - 500) / 100));  // ALDO1..3 3.3 V, keep reserved bits
   }
+  // Fuel gauge + ADC for BatteryMonitor: gauge enable (0x18 b3), ADC channels batt/VBUS/VSYS
+  // (0x30 b0,b2,b3), battery detect (0x68 b0). TS (b1) is left as the stock firmware had it.
+  if (rd(0x18, v)) wr(0x18, v | 0x08);
+  if (rd(0x30, v)) wr(0x30, v | 0x0D);
+  if (rd(0x68, v)) wr(0x68, v | 0x01);
+  // Charger / protection set-up from the vendor's axp_init() (components/axpPower/axp_prot.cpp),
+  // cross-checked against XPowersLib enum values and CrossMux's configure(). Masked updates so
+  // unrelated bits are kept. Without this the chip charges on its power-on defaults.
+  auto upd = [&](uint8_t reg, uint8_t mask, uint8_t val) {
+    uint8_t cur;
+    if (rd(reg, cur)) wr(reg, (cur & ~mask) | (val & mask));
+  };
+  upd(0x15, 0x0F, 0x06);  // VBUS input voltage limit 4.36 V
+  upd(0x16, 0x07, 0x04);  // VBUS input current limit 1500 mA
+  upd(0x24, 0x07, 0x00);  // system power-down (VOFF) 2.6 V
+  upd(0x61, 0x03, 0x02);  // pre-charge 50 mA
+  upd(0x62, 0x1F, 0x08);  // constant-current charge 200 mA
+  upd(0x63, 0x0F, 0x01);  // termination 25 mA
+  upd(0x64, 0x07, 0x03);  // charge target 4.2 V
+  upd(0x6A, 0x07, 0x04);  // RTC backup-cell charge voltage 3.0 V
+  upd(0x18, 0x04, 0x04);  // enable RTC backup-cell charging
+  upd(0x1A, 0xFF, 0x55);  // low-battery warn 10 %, shutdown 5 %
+  upd(0x69, 0x37, 0x05);  // charge LED off (manual control, off)
   wr(0x80, dc | 0x01);  // enable DC1
-  wr(0x90, ldo | 0x07);  // enable ALDO1..3
+  // ALDO3 feeds the e-paper panel; ALDO1/ALDO2 only feed the unused ES8311 audio codec/amp, so
+  // leave them off to save battery. (The stock firmware left every rail on.)
+  wr(0x90, (ldo | 0x04) & ~0x03);
   if (rd(0x80, dc) && rd(0x90, ldo)) esp_rom_printf("[AXP] after:  DC_EN=0x%02X LDO_EN=0x%02X\n", dc, ldo);
 }
 #endif

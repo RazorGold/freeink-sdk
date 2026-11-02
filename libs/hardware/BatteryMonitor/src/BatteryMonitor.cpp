@@ -67,6 +67,40 @@ bool readReg8(uint8_t addr, uint8_t reg, uint8_t& out) {
   return true;
 }
 
+// AXP2101 PMIC "gauge" (Waveshare 3.97"): battery %, voltage, charge state and
+// VBUS all come from the PMIC. Registers per XPowersLib AXP2101Constants.h.
+constexpr uint8_t AXP_STATUS1 = 0x00;       // b5 VBUS good, b3 battery connected
+constexpr uint8_t AXP_STATUS2 = 0x01;       // b7:5 battery current direction: 1 charging, 2 discharging
+constexpr uint8_t AXP_ADC_VBAT_H = 0x34;    // 14-bit mV: (H & 0x1F) << 8 | L
+constexpr uint8_t AXP_BAT_PERCENT = 0xA4;   // 0-100
+
+bool isAxp() { return BoardConfig::ACTIVE.batteryGauge.chip == BoardConfig::GaugeChip::Axp2101; }
+
+// Fills every field the PMIC can report. Returns false only if the PMIC does not answer.
+bool readAxpStatus(BatteryMonitor::Status& status) {
+  const uint8_t addr = BoardConfig::ACTIVE.batteryGauge.gaugeAddr;
+  uint8_t st1 = 0, st2 = 0;
+  if (!readReg8(addr, AXP_STATUS1, st1) || !readReg8(addr, AXP_STATUS2, st2)) return false;
+  status.supported = true;
+  status.externalPowerKnown = true;
+  status.externalPower = (st1 & 0x20) != 0;
+  status.chargingKnown = true;
+  status.charging = ((st2 >> 5) & 0x07) == 0x01;
+  if (st1 & 0x08) {  // battery connected; otherwise the % and mV registers are meaningless
+    uint8_t pct = 0;
+    if (readReg8(addr, AXP_BAT_PERCENT, pct)) {
+      status.percentageKnown = true;
+      status.percentage = pct > 100 ? 100 : pct;
+    }
+    uint8_t h = 0, l = 0;
+    if (readReg8(addr, AXP_ADC_VBAT_H, h) && readReg8(addr, AXP_ADC_VBAT_H + 1, l)) {
+      status.millivoltsKnown = true;
+      status.millivolts = static_cast<uint16_t>(((h & 0x1F) << 8) | l);
+    }
+  }
+  return true;
+}
+
 // Charging state for an I2C-gauge board, from the active board's gauge config.
 // Two sources, in order of preference:
 //   1. A dedicated charger IC (BQ25896): CHRG_STAT in REG0B[4:3] — 01 pre-charge
@@ -80,6 +114,11 @@ bool readReg8(uint8_t addr, uint8_t reg, uint8_t& out) {
 // a board with neither gaugeAddr nor chargerAddr).
 bool readGaugeCharging(bool& known) {
   const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  if (isAxp()) {
+    BatteryMonitor::Status st;
+    known = readAxpStatus(st) && st.chargingKnown;
+    return known && st.charging;
+  }
   if (g.chargerAddr != 0) {
     uint8_t status = 0;
     if (readReg8(g.chargerAddr, BQ25896_REG_STATUS, status)) {
@@ -146,6 +185,10 @@ uint16_t BatteryMonitor::readPercentage() const {
   // Runtime, per active profile: gauge boards (X3, LilyGo) read SoC over I2C; ADC
   // boards (X4) in the same binary fall through to the divider path below.
   if (BoardConfig::ACTIVE.batteryGauge.gaugeAddr != 0) {
+    if (isAxp()) {
+      Status st;
+      return (readAxpStatus(st) && st.percentageKnown) ? st.percentage : 0;
+    }
     uint16_t soc = 0;
     if (!readReg16(BoardConfig::ACTIVE.batteryGauge.gaugeAddr, BQ27220_STATE_OF_CHARGE, soc)) return 0;
     return soc > 100 ? 100 : soc;
@@ -163,6 +206,12 @@ uint16_t BatteryMonitor::readPercentage() const {
 bool BatteryMonitor::readPercentageChecked(uint16_t& out) const {
 #if FREEINK_BATTERY_I2C_GAUGE
   if (BoardConfig::ACTIVE.batteryGauge.gaugeAddr != 0) {
+    if (isAxp()) {
+      Status st;
+      if (!readAxpStatus(st) || !st.percentageKnown) return false;
+      out = st.percentage;
+      return true;
+    }
     uint16_t soc = 0;
     if (!readReg16(BoardConfig::ACTIVE.batteryGauge.gaugeAddr, BQ27220_STATE_OF_CHARGE, soc)) return false;
     out = soc > 100 ? 100 : soc;
@@ -185,6 +234,11 @@ BatteryMonitor::Status BatteryMonitor::readStatus() const {
 
 #if FREEINK_BATTERY_I2C_GAUGE
   if (BoardConfig::ACTIVE.batteryGauge.gaugeAddr != 0) {
+    if (isAxp()) {
+      readAxpStatus(status);
+      status.supported = true;
+      return status;
+    }
     status.supported = true;
     uint16_t soc = 0;
     if (readReg16(BoardConfig::ACTIVE.batteryGauge.gaugeAddr, BQ27220_STATE_OF_CHARGE, soc)) {
@@ -230,6 +284,10 @@ BatteryMonitor::Status BatteryMonitor::readStatus() const {
 uint16_t BatteryMonitor::readMillivolts() const {
 #if FREEINK_BATTERY_I2C_GAUGE
   if (BoardConfig::ACTIVE.batteryGauge.gaugeAddr != 0) {
+    if (isAxp()) {
+      Status st;
+      return (readAxpStatus(st) && st.millivoltsKnown) ? st.millivolts : 0;
+    }
     uint16_t gaugeMv = 0;
     readReg16(BoardConfig::ACTIVE.batteryGauge.gaugeAddr, BQ27220_VOLTAGE, gaugeMv);
     return gaugeMv;  // gauge reports true battery mV (no divider)
